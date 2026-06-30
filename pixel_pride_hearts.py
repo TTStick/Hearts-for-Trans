@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "easter_egg": True, # 提示彩蛋
     "scale": 0.82,      # 爱心高度占任务栏高度比例（含描边）
     "margin": 10,       # 距任务栏左边缘的间距（像素）
+    "auto_hide_fullscreen": True,  # 全屏游戏/视频时自动隐藏
 }
 
 # 像素爱心形状（# = 实心，. = 空）。7 行 8 列，外加描边后为 9x10。
@@ -179,6 +180,70 @@ GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
 
+# ---- 全屏检测相关 ----
+shell32 = ctypes.windll.shell32
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.MonitorFromWindow.restype = wintypes.HANDLE
+user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+
+
+def is_fullscreen_app_active(self_hwnd=0):
+    """检测前台是否有全屏游戏 / 全屏视频 / 演示模式。
+
+    两种判据满足其一即认为处于全屏：
+    1) Shell 通知状态为 D3D 独占全屏(3) 或 演示模式(4)
+    2) 前台窗口铺满了它所在的整块显示器（独占/无边框全屏）
+    （普通最大化窗口不会触发，因为它不会盖住任务栏）
+    """
+    # 判据 1：Shell 通知状态
+    try:
+        state = ctypes.c_int(0)
+        if shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+            if state.value in (3, 4):  # 3=D3D全屏游戏, 4=演示模式
+                return True
+    except Exception:
+        pass
+
+    # 判据 2：前台窗口铺满整个显示器
+    try:
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or int(hwnd) == int(self_hwnd):
+            return False
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value in ("Progman", "WorkerW",
+                         "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return False
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+        mr = mi.rcMonitor
+        if (rect.left <= mr.left and rect.top <= mr.top
+                and rect.right >= mr.right and rect.bottom >= mr.bottom):
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def get_taskbar_rect():
     """返回主任务栏 (left, top, right, bottom)，物理像素；失败返回 None。"""
@@ -270,7 +335,7 @@ class HeartOverlay(QWidget):
         # 定时器：保持位置 + 置顶
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_position)
-        self.timer.start(800)
+        self.timer.start(500)
 
         self.update_position()
         self.show()
@@ -307,6 +372,17 @@ class HeartOverlay(QWidget):
     def update_position(self):
         if self._dragging:
             return
+
+        # 全屏游戏 / 视频 / 演示模式 → 隐藏，避免遮挡画面
+        if self.cfg.get("auto_hide_fullscreen", True):
+            if is_fullscreen_app_active(int(self.winId())):
+                if self.isVisible():
+                    self.hide()
+                return
+            else:
+                if not self.isVisible():
+                    self.show()
+                    self._apply_ex_style()
 
         rect = get_taskbar_rect()
         if rect:
@@ -417,6 +493,12 @@ class HeartOverlay(QWidget):
         act_egg.triggered.connect(self.toggle_egg)
         menu.addAction(act_egg)
 
+        act_fs = QAction("全屏时自动隐藏", self)
+        act_fs.setCheckable(True)
+        act_fs.setChecked(self.cfg.get("auto_hide_fullscreen", True))
+        act_fs.triggered.connect(self.toggle_auto_hide)
+        menu.addAction(act_fs)
+
         menu.addSeparator()
 
         act_about = QAction("关于", self)
@@ -443,6 +525,15 @@ class HeartOverlay(QWidget):
     def toggle_egg(self, checked):
         self.cfg["easter_egg"] = checked
         save_config(self.cfg)
+
+    def toggle_auto_hide(self, checked):
+        self.cfg["auto_hide_fullscreen"] = checked
+        save_config(self.cfg)
+        # 关闭该功能时，若当前被隐藏则立即恢复显示
+        if not checked and not self.isVisible():
+            self.show()
+            self._apply_ex_style()
+        self.update_position()
 
     def show_about(self):
         QMessageBox.information(
